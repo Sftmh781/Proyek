@@ -1,1 +1,621 @@
+install.packages("readxl")
+install.packages(c("ggplot2", "dplyr", "numDeriv", "carData", "quantreg", 
+                   "pbkrtest", "lme4", "MatrixModels", "SparseM", 
+                   "nloptr", "minqa", "doBy", "Rdpack", "broom", 
+                   "Deriv", "tidyr", "cowplot", "scales", "Rcpp", 
+                   "RcppEigen", "farver", "viridisLite", "rbibutils", "microbenchmark"))
+
+install.packages("betareg")
+install.packages("Formula")
+install.packages("car")
+install.packages("faraway")
+install.packages("writexl")
+
+library(faraway)
+library(readxl)
+library(betareg)
+library(Formula)
+library(car)
+library(hnp)
+library(EnvStats)
+library(ggplot2)
+library(dplyr)
+library(writexl)
+
+#------------------------------------------------------------------------#
+
+#Import Data
+data <- read_excel("DataSkripsi.xlsx")
+
+#Cek Data missing
+colSums(is.na(data))
+
+# Buat list nama variabel independen
+vars <- c("Populasi", "GNI", "GDP", "Investasi", "Inflasi", 
+          "Debt", "Nox", "SO2", "CO", "BlackCarbon", "NH3", "NMVOCs")
+
+#Cek data numeriks dan character
+sapply(data[vars], class)
+
+# Konversi semua variabel karakter menjadi numerik
+data[vars] <- lapply(data[vars], function(x) as.numeric(as.character(x)))
+
+# Standarisasi semua variabel numerik
+data[vars] <- lapply(data[vars], scale)
+
+#---------------------------------------------------------------------------#
+
+##MEMBUAT MODEL REGRESI BETA##
+
+model <- betareg(CPI ~ Populasi + GNI + GDP + Investasi + Inflasi + Debt +
+                   Nox + SO2 + CO + BlackCarbon + NH3 + NMVOCs,
+                 data = data, link = "logit")
+summary(model)
+
+#---------------------------------------------------------------------------#
+
+#1. pseudo R-squared#
+model1 <- betareg(CPI ~ Populasi + GNI + GDP + Investasi + Inflasi + Debt +
+                   Nox + SO2 + CO + BlackCarbon + NH3 + NMVOCs,
+                 data = data, link = "logit")
+summary(model1)
+mu_hat <- fitted(model1)
+y <- data$CPI
+
+# Konversi ke numerik
+y <- as.numeric(y)
+mu_hat <- as.numeric(mu_hat)
+
+# Hindari nilai 0 atau 1
+epsilon <- 1e-6
+y <- pmin(pmax(y, epsilon), 1 - epsilon)
+mu_hat <- pmin(pmax(mu_hat, epsilon), 1 - epsilon)
+
+# Fungsi logit
+logit <- function(x) log(x / (1 - x))
+
+# Transformasi logit
+g_mu_hat <- logit(mu_hat)
+g_y <- logit(y)
+
+# Hitung pseudo R-squared
+Rp2 <- cor(g_mu_hat, g_y)^2
+Rp2
+
+#--------------------------------------------------------------------#
+
+#2.	Ketidaksesuaian model (discrepancy)# 
+# Pastikan nilai y dan mu_hat berada di (0, 1)
+epsilon <- 1e-6
+y <- pmin(pmax(y, epsilon), 1 - epsilon)
+mu_hat <- pmin(pmax(mu_hat, epsilon), 1 - epsilon)
+phi_hat <- model1$phi
+
+# Fungsi log-likelihood beta per observasi
+ll_beta <- function(y, mu, phi) {
+  mu <- pmin(pmax(mu, epsilon), 1 - epsilon)  # cegah mu = 0 atau 1
+  term1 <- lgamma(phi)
+  term2 <- lgamma(mu * phi)
+  term3 <- lgamma((1 - mu) * phi)
+  term4 <- (mu * phi - 1) * log(y)
+  term5 <- ((1 - mu) * phi - 1) * log(1 - y)
+  ll <- term1 - term2 - term3 + term4 + term5
+  return(ll)
+}
+
+# Hitung ulang log-likelihood model jenuh dan model
+ll_saturated <- ll_beta(y, y, phi_hat)       # mu_tilde ≈ y
+ll_model <- ll_beta(y, mu_hat, phi_hat)      # mu_hat dari model
+
+# Selisih log-likelihood bisa jadi negatif → atasi dengan abs atau filter
+ll_diff <- 2 * (ll_saturated - ll_model)
+
+# Jika ada nilai negatif → set jadi 0 untuk hindari sqrt(NaN)
+ll_diff[ll_diff < 0] <- 0
+
+# Hitung r_d dan deviasi total
+r_d <- sign(y - mu_hat) * sqrt(ll_diff)
+D <- sum(r_d^2)
+D
+
+# Tambahkan kolom r_d ke data frame
+discrepancy_df <- data.frame(
+  Country = data$Country,
+  CPI = data$CPI,
+  Contribution = ll_diff,
+  ResidualDeviance = r_d,
+  Outlier = abs(r_d) > 2  # Tandai jika abs(r_d) > 2
+)
+
+# Urutkan dari kontribusi terbesar
+discrepancy_df_sorted <- discrepancy_df[order(-discrepancy_df$Contribution), ]
+
+# Scatterplot: r_d vs CPI
+ggplot(discrepancy_df, aes(x = CPI, y = ResidualDeviance, color = Outlier)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = c(-2, 2), linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("black", "red")) +
+  labs(
+    title = "Plot Residual Deviance vs CPI",
+    x = "CPI",
+    y = expression(r[d]),
+    color = "Outlier"
+  ) +
+  theme_minimal()
+
+
+#------------------------------------------------------------------------#
+
+#3.	Standardized residuals #
+# Ambil nilai aktual dan prediksi
+y <- as.numeric(data$CPI)
+mu_hat <- as.numeric(fitted(model1))
+
+# Estimasi phi (dari model)
+phi_hat <- model1$phi  
+
+# Hindari nilai 0 atau 1 yang membuat logit tidak terdefinisi
+epsilon <- 1e-6
+y <- pmin(pmax(y, epsilon), 1 - epsilon)
+mu_hat <- pmin(pmax(mu_hat, epsilon), 1 - epsilon)
+
+# Hitung varians dari y_i
+var_y_hat <- (mu_hat * (1 - mu_hat)) / (1 + phi_hat)
+
+# Hitung residual standar
+standardized_resid <- (y - mu_hat) / sqrt(var_y_hat)
+
+# Lihat hasilnya
+head(standardized_resid)
+
+# Buat data frame hasil
+hasil_residu <- data.frame(
+  Negara = data$Country,          # Kolom nama negara
+  CPI_Aktual = y,                 # Nilai CPI aktual (yang sudah dibersihkan)
+  CPI_Prediksi = mu_hat,          # Nilai prediksi dari model
+  Standardized_Residual = standardized_resid  # Residu baku
+)
+
+# Tambahkan kolom status outlier
+hasil_residu$Outlier <- ifelse(abs(hasil_residu$Standardized_Residual) > 2, "Outlier", "Bukan Outlier")
+
+# Lihat beberapa baris yang merupakan outlier
+subset(hasil_residu, Outlier == "Outlier")
+
+# Plot residual terhadap indeks observasi
+plot(standardized_resid, main = "Standardized Residuals", 
+     ylab = "Standardized Residual", xlab = "Index", pch = 19)
+
+#----------------------------------------------------------------------#
+
+#4. Generelized Leverage#
+model <- betareg(CPI ~ Populasi + GNI + GDP + Investasi + Inflasi + Debt +
+                   Nox + SO2 + CO + BlackCarbon + NH3 + NMVOCs,
+                 data = data, link = "logit")
+
+# Ekstrak komponen penting
+X <- model.matrix(model)
+y <- model$y
+mu <- model$fitted.values
+phi <- as.numeric(coef(model)["(phi)"])
+
+
+# Hitung T = diag(dmu/deta), karena link logit ⇒ dμ/dη = μ(1−μ)
+T_diag <- mu * (1 - mu)
+T <- diag(T_diag)
+
+# Hitung M = diag(1 / (y(1 - y)))
+M_diag <- 1 / (y * (1 - y))
+M <- diag(M_diag)
+
+q_diag <- sapply(1:length(y), function(i) {
+  mu_i <- mu[i]
+  y_i <- y[i]
+  g_prime <- mu_i * (1 - mu_i)
+  g_double_prime <- (1 - 2 * mu_i)^2
+  mu_star <- log(mu_i / (1 - mu_i))
+  y_star <- log(y_i / (1 - y_i))
+  
+  term1 <- phi^2 * (trigamma(mu_i * phi) + trigamma((1 - mu_i) * phi))
+  term2 <- (y_star - mu_star) * g_double_prime / g_prime
+  q_i <- (term1 + term2) / (g_prime^2)
+  return(q_i)
+})
+Q <- diag(q_diag)
+
+# Hitung generalized leverage matrix
+GL <- T %*% X %*% solve(t(X) %*% Q %*% X) %*% t(X) %*% T %*% M
+
+# Tampilkan generalized leverage (diagonalnya yang utama)
+GL_diag <- diag(GL)
+round(GL_diag, 4)
+
+plot(GL_diag, type = "h", main = "Generalized Leverage", ylab = "GL[i,i]")
+cutoff <- 2 * mean(GL_diag)  # atau opsi lain
+abline(h = cutoff, col = "red", lty = 2)
+
+# Misalkan sudah ada GL_diag dan cutoff
+# Buat indeks data berpengaruh
+berpengaruh_idx <- which(GL_diag > cutoff)
+
+# Tampilkan data asli yang berpengaruh
+data_berpengaruh <- data[berpengaruh_idx, ]
+
+data$GL_diag <- diag(GL)
+data$berpengaruh <- ifelse(data$GL_diag > cutoff, TRUE, FALSE)
+data
+
+Data_GL <- data[, c("Country", "GL_diag", "berpengaruh")]
+Data_GL$cutoff <- cutoff
+
+View(Data_GL)
+
+Data_GL_TRUE <- Data_GL %>%
+  filter(berpengaruh == TRUE)
+
+View(Data_GL_TRUE)
+
+# Tambahkan kolom indeks jika belum ada
+data$Index <- 1:nrow(data)
+
+# Plot menggunakan ggplot
+ggplot(data, aes(x = Index, y = GL_diag, color = berpengaruh)) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = cutoff, color = "red", linetype = "dashed") +
+  scale_color_manual(values = c("black", "red")) +
+  labs(
+    title = "Generalized Leverage untuk Setiap Observasi",
+    x = "Index Observasi",
+    y = expression(GL[i,i]),
+    color = "Berpengaruh (> cutoff)"
+  ) +
+  theme_minimal()
+
+
+#--------------------------------------------------------------------------#
+
+#5. Cook's Distance#
+
+# Step 1: Generalized Leverage tetap dihitung (bisa digunakan untuk referensi)
+data$GL_diag <- GL_diag
+cutoff_GL <- 2 * mean(GL_diag)
+data$Leverage_Tinggi <- ifelse(data$GL_diag > cutoff_GL, TRUE, FALSE)
+
+# Step 2: Hitung Cook's Distance untuk seluruh data
+resid_pearson <- residuals(model, type = "pearson")
+standardized_resid <- resid_pearson / sqrt(1 - GL_diag)
+k <- length(coef(model))  # jumlah parameter model
+cooks_distance <- (GL_diag * standardized_resid^2) / (k * (1 - GL_diag)^2)
+data$CookD <- cooks_distance
+
+# Gunakan hanya syarat CookD > quantile(0.95)
+cutoff_Cook <- quantile(cooks_distance, 0.95)
+data$Influential <- ifelse(cooks_distance > cutoff_Cook, TRUE, FALSE)
+
+# Buat tabel hasil
+hasil_influential <- data.frame(
+  Country = data$Country,
+  GL_diag = round(data$GL_diag, 5),
+  CookD = round(cooks_distance, 5),
+  Cutoff_Cook = round(cutoff_Cook, 5),
+  Influential = data$Influential
+)
+
+data$Keterangan <- ifelse(cooks_distance > cutoff_Cook, "Outlier", "Bukan Outlier")
+
+# Buat tabel hasil akhir
+hasil_cook <- data.frame(
+  Country = data$Country,
+  CookD = round(cooks_distance,10),
+  Cutoff_Cook = round(cutoff_Cook,10),
+  Keterangan = data$Keterangan
+)
+
+# Tampilkan tabel lengkap atau filter yang outlier
+View(hasil_cook)
+
+outlier_only <- subset(hasil_cook, Keterangan == "Outlier")
+View(outlier_only)
+
+ggplot(data, aes(x = Index, y = CookD)) +
+  geom_segment(aes(xend = Index, yend = 0), color = "steelblue") +  # garis batang
+  geom_hline(yintercept = cutoff_Cook, color = "red", linetype = "dashed") +  # garis cutoff
+  geom_point(aes(color = Influential), size = 2) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(
+    title = "Cook's Distance",
+    subtitle = "Garis merah = Cutoff quantile 95% Cook's Distance",
+    x = "Index Observasi",
+    y = "Cook's Distance",
+    color = "Influential"
+  ) +
+  theme_minimal()
+
+#-------------------------------------------------------------------------#
+
+# Gabungkan semua indikator outlier
+data$outlier_discrepancy <- abs(discrepancy_df$ResidualDeviance) > 2
+data$outlier_stdresid <- abs(standardized_resid) > 2
+data$outlier_gl <- data$GL_diag > cutoff
+data$outlier_cook <- data$CookD > cutoff_Cook
+
+# Gabungkan hasil semua metode
+data$outlier_final <- data$outlier_discrepancy | data$outlier_stdresid | data$outlier_gl | data$outlier_cook
+
+# Tampilkan hanya Observasi dan Country dari outlier
+outlier_ringkas <- data.frame(
+  Observasi = which(data$outlier_final),
+  Country = data$Country[data$outlier_final]
+)
+
+# Buat vektor indeks outlier
+indeks_outlier <- outlier_ringkas$Observasi
+
+# Hapus baris yang merupakan outlier dari data asli
+data_bersih <- data[-indeks_outlier, ]
+
+# Cek hasil
+print(nrow(data))         # Jumlah observasi sebelum
+print(nrow(data_bersih))  # Jumlah observasi setelah outlier dihapus
+
+#---------------------------------------------------------------------------#
+
+##MEMBUAT MODEL REGRESI BETA AKHIR##
+
+model_bersih <- betareg(CPI ~ Populasi + GNI + GDP + Investasi + Inflasi + Debt +
+                   Nox + SO2 + CO + BlackCarbon + NH3 + NMVOCs,
+                 data = data_bersih, link = "logit")
+summary(model_bersih)
+
+#---------------------------------------------------------------------------#
+
+#1. pseudo R-squared#
+
+mu_hat <- fitted(model_bersih)
+y <- data_bersih$CPI
+
+# Konversi ke numerik
+y <- as.numeric(y)
+mu_hat <- as.numeric(mu_hat)
+
+# Hindari nilai 0 atau 1
+epsilon <- 1e-6
+y <- pmin(pmax(y, epsilon), 1 - epsilon)
+mu_hat <- pmin(pmax(mu_hat, epsilon), 1 - epsilon)
+
+# Fungsi logit
+logit <- function(x) log(x / (1 - x))
+
+# Transformasi logit
+g_mu_hat <- logit(mu_hat)
+g_y <- logit(y)
+
+# Hitung pseudo R-squared
+Rp2 <- cor(g_mu_hat, g_y)^2
+Rp2
+
+#--------------------------------------------------------------------#
+
+#2.	Ketidaksesuaian model (discrepancy)# 
+# Pastikan nilai y dan mu_hat berada di (0, 1)
+epsilon <- 1e-6
+y <- pmin(pmax(y, epsilon), 1 - epsilon)
+mu_hat <- pmin(pmax(mu_hat, epsilon), 1 - epsilon)
+phi_hat <- model_bersih$phi
+
+# Fungsi log-likelihood beta per observasi
+ll_beta <- function(y, mu, phi) {
+  mu <- pmin(pmax(mu, epsilon), 1 - epsilon)  # cegah mu = 0 atau 1
+  term1 <- lgamma(phi)
+  term2 <- lgamma(mu * phi)
+  term3 <- lgamma((1 - mu) * phi)
+  term4 <- (mu * phi - 1) * log(y)
+  term5 <- ((1 - mu) * phi - 1) * log(1 - y)
+  ll <- term1 - term2 - term3 + term4 + term5
+  return(ll)
+}
+
+# Hitung ulang log-likelihood model jenuh dan model
+ll_saturated <- ll_beta(y, y, phi_hat)       # mu_tilde ≈ y
+ll_model <- ll_beta(y, mu_hat, phi_hat)      # mu_hat dari model
+
+# Selisih log-likelihood bisa jadi negatif → atasi dengan abs atau filter
+ll_diff <- 2 * (ll_saturated - ll_model)
+
+# Jika ada nilai negatif → set jadi 0 untuk hindari sqrt(NaN)
+ll_diff[ll_diff < 0] <- 0
+
+# Hitung r_d dan deviasi total
+r_d <- sign(y - mu_hat) * sqrt(ll_diff)
+D <- sum(r_d^2)
+
+# Tambahkan kolom r_d ke data frame
+discrepancy_df <- data.frame(
+  Country = data_bersih$Country,
+  CPI = data_bersih$CPI,
+  Contribution = ll_diff,
+  ResidualDeviance = r_d,
+  Outlier = abs(r_d) > 2  # Tandai jika abs(r_d) > 2
+)
+
+# Urutkan dari kontribusi terbesar
+discrepancy_df_sorted <- discrepancy_df[order(-discrepancy_df$Contribution), ]
+
+# Scatterplot: r_d vs CPI
+ggplot(discrepancy_df, aes(x = CPI, y = ResidualDeviance, color = Outlier)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = c(-2, 2), linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("black", "red")) +
+  labs(
+    title = "Plot Residual Deviance vs CPI",
+    x = "CPI",
+    y = expression(r[d]),
+    color = "Outlier"
+  ) +
+  theme_minimal()
+
+
+#------------------------------------------------------------------------#
+
+#3.	Standardized residuals #
+# Ambil nilai aktual dan prediksi
+y <- as.numeric(data_bersih$CPI)
+mu_hat <- as.numeric(fitted(model_bersih))
+
+# Estimasi phi (dari model)
+phi_hat <- model_bersih$phi  
+
+# Hindari nilai 0 atau 1 yang membuat logit tidak terdefinisi
+epsilon <- 1e-6
+y <- pmin(pmax(y, epsilon), 1 - epsilon)
+mu_hat <- pmin(pmax(mu_hat, epsilon), 1 - epsilon)
+
+# Hitung varians dari y_i
+var_y_hat <- (mu_hat * (1 - mu_hat)) / (1 + phi_hat)
+
+# Hitung residual standar
+standardized_resid <- (y - mu_hat) / sqrt(var_y_hat)
+
+# Buat data frame hasil
+hasil_residu <- data.frame(
+  Negara = data_bersih$Country,          # Kolom nama negara
+  CPI_Aktual = y,                 # Nilai CPI aktual (yang sudah dibersihkan)
+  CPI_Prediksi = mu_hat,          # Nilai prediksi dari model
+  Standardized_Residual = standardized_resid  # Residu baku
+)
+
+# Tambahkan kolom status outlier
+hasil_residu$Outlier <- ifelse(abs(hasil_residu$Standardized_Residual) > 2, "Outlier", "Bukan Outlier")
+
+# Lihat beberapa baris yang merupakan outlier
+subset(hasil_residu, Outlier == "Outlier")
+
+# Plot residual terhadap indeks observasi
+plot(standardized_resid, main = "Standardized Residuals", 
+     ylab = "Standardized Residual", xlab = "Index", pch = 19)
+
+#--------------------------------------------------------------------------#
+
+#4. Generelized Leverage#
+# Ekstrak komponen penting
+X <- model.matrix(model_bersih)
+y <- model_bersih$y
+mu <- model_bersih$fitted.values
+phi <- as.numeric(coef(model_bersih)["(phi)"])
+
+
+# Hitung T = diag(dmu/deta), karena link logit ⇒ dμ/dη = μ(1−μ)
+T_diag1 <- mu * (1 - mu)
+T <- diag(T_diag1)
+
+# Hitung M = diag(1 / (y(1 - y)))
+M_diag1 <- 1 / (y * (1 - y))
+M <- diag(M_diag1)
+
+q_diag1 <- sapply(1:length(y), function(i) {
+  mu_i <- mu[i]
+  y_i <- y[i]
+  g_prime <- mu_i * (1 - mu_i)
+  g_double_prime <- (1 - 2 * mu_i)^2
+  mu_star <- log(mu_i / (1 - mu_i))
+  y_star <- log(y_i / (1 - y_i))
+  
+  term1 <- phi^2 * (trigamma(mu_i * phi) + trigamma((1 - mu_i) * phi))
+  term2 <- (y_star - mu_star) * g_double_prime / g_prime
+  q_i <- (term1 + term2) / (g_prime^2)
+  return(q_i)
+})
+Q <- diag(q_diag1)
+
+# Hitung generalized leverage matrix
+GL <- T %*% X %*% solve(t(X) %*% Q %*% X) %*% t(X) %*% T %*% M
+
+# Tampilkan generalized leverage (diagonalnya yang utama)
+GL_diag1 <- diag(GL)
+round(GL_diag1, 4)
+
+plot(GL_diag1, type = "h", main = "Generalized Leverage", ylab = "GL[i,i]")
+cutoff <- 2 * mean(GL_diag1) 
+abline(h = cutoff, col = "red", lty = 2)
+
+# Misalkan sudah ada GL_diag dan cutoff
+# Buat indeks data berpengaruh
+berpengaruh_idx <- which(GL_diag1 > cutoff)
+
+# Tampilkan data asli yang berpengaruh
+data_berpengaruh <- data[berpengaruh_idx, ]
+
+data_bersih$GL_diag1 <- diag(GL)
+data_bersih$berpengaruh <- ifelse(data_bersih$GL_diag1 > cutoff, TRUE, FALSE)
+
+Data_GL1 <- data_bersih[, c("Country", "GL_diag1", "berpengaruh")]
+Data_GL$cutoff <- cutoff
+
+Data_GL_TRUE <- Data_GL1 %>%
+  filter(berpengaruh == TRUE)
+
+Data_GL1 <- Data_GL1 %>%
+  filter(!berpengaruh)
+View(Data_GL1)
+
+# Tambahkan kolom Index pada Data_GL jika belum ada
+Data_GL1$Index <- 1:nrow(Data_GL1)
+
+# Plot hanya untuk data yang tidak berpengaruh
+ggplot(Data_GL1 %>% filter(!berpengaruh), aes(x = Index, y = GL_diag1)) +
+  geom_point(size = 2, color = "blue") +
+  geom_hline(yintercept = cutoff, color = "red", linetype = "dashed") +
+  labs(
+    title = "Generalized Leverage Akhir",
+    x = "Index Observasi",
+    y = expression(GL[i,i])
+  ) +
+  theme_minimal()
+
+#--------------------------------------------------------------------------#
+
+#5. Cook's Distance#
+# Tambahkan kolom CookD dan Influential ke Data_GL
+Data_GL1$CookD <- data_bersih$CookD[data_bersih$berpengaruh == FALSE]
+Data_GL1$Influential <- data_bersih$Influential[data_bersih$berpengaruh == FALSE]
+
+# Pastikan kolom Index sudah ada
+Data_GL1$Index <- 1:nrow(Data_GL1)
+
+ggplot(Data_GL1, aes(x = Index, y = CookD)) +
+  geom_segment(aes(xend = Index, yend = 0), color = "steelblue") +  # garis batang
+  geom_hline(yintercept = cutoff_Cook, color = "red", linetype = "dashed") +  # garis cutoff
+  geom_point(aes(color = Influential), size = 2) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(
+    title = "Cook's Distance Setelah Penghapusan Data Berpengaruh",
+    subtitle = "Garis merah = Cutoff quantile 95% Cook's Distance",
+    x = "Index Observasi",
+    y = "Cook's Distance",
+    color = "Influential"
+  ) +
+  theme_minimal()
+
+#--------------------------------------------------------------------------#
+
+##UJI G
+# Model tanpa X (model nol)
+model_L0 <- betareg(CPI ~ 1, data = data_bersih, link = "logit")
+
+#nilai log-likelihood dari kedua model
+LL0 <- logLik(model_L0)
+LL0
+LL1 <- logLik(model_bersih)
+LL1
+#Hitung statistik uji G
+G_stat <- -2 * (as.numeric(LL0) - as.numeric(LL1))
+#Hitung derajat bebas
+df <- attr(LL1, "df") - attr(LL0, "df")
+#Hitung p-value
+p_value <- pchisq(G_stat, df = df, lower.tail = FALSE)
+
+# Tampilkan hasil
+cat("Statistik G =", G_stat, "\n")
+cat("Derajat Bebas =", df, "\n")
+cat("P-value =", p_value, "\n")
 
